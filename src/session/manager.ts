@@ -13,6 +13,7 @@ import {
   UpdateCommand,
   QueryCommand,
   DeleteCommand,
+  ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
 import type {
   PersistedSessionState,
@@ -74,14 +75,8 @@ export async function initializeTable(): Promise<void> {
             ],
             Projection: { ProjectionType: "ALL" },
           },
-          {
-            IndexName: "PendingIndex",
-            KeySchema: [
-              { AttributeName: "status", KeyType: "HASH" },
-              { AttributeName: "expiresAt", KeyType: "RANGE" },
-            ],
-            Projection: { ProjectionType: "ALL" },
-          },
+          // P1-4修正: PendingIndexを削除（ホットキー問題回避）
+          // 代わりにUserIndex/GuildIndexでstatus=RUNNINGをクエリ可能
         ],
         BillingMode: "PAY_PER_REQUEST",
         // Note: TTL is configured separately via UpdateTimeToLiveCommand
@@ -165,13 +160,22 @@ export async function restoreState(sessionId: string): Promise<RestoredSession |
 /**
  * 未完了セッションを取得
  *
- * @param filter - フィルタ条件
+ * P1-4修正: PendingIndex削除に伴い、userIdまたはguildId必須に変更
+ * （ホットキー問題回避のため、全件取得は非推奨）
+ *
+ * @param filter - フィルタ条件 (userIdまたはguildId必須)
  * @returns 未完了セッション一覧
  */
 export async function getPendingSessions(
   filter: PendingSessionsFilter = {},
 ): Promise<PersistedSessionState[]> {
   const now = Math.floor(Date.now() / 1000);
+
+  // P1-4修正: userIdまたはguildIdが必須
+  if (!filter.userId && !filter.guildId) {
+    console.warn("[SessionManager] getPendingSessions requires userId or guildId");
+    return [];
+  }
 
   // ステータスが指定されている場合はGSIを使用
   if (filter.status) {
@@ -190,9 +194,6 @@ export async function getPendingSessions(
       indexName = "GuildIndex";
       keyCondition = "guildId = :guildId AND #status = :status";
       expressionValues[":guildId"] = filter.guildId;
-    } else {
-      indexName = "PendingIndex";
-      keyCondition = "#status = :status AND expiresAt > :now";
     }
 
     const response = await docClient.send(
@@ -210,19 +211,31 @@ export async function getPendingSessions(
     return (response.Items as unknown as PersistedSessionState[]) || [];
   }
 
-  // フィルタなしで全未完了セッションを取得
+  // userIdまたはguildIdでRUNNINGセッションを取得
+  const indexName = filter.userId ? "UserIndex" : "GuildIndex";
+  const keyCondition = filter.userId
+    ? "userId = :userId AND #status = :status"
+    : "guildId = :guildId AND #status = :status";
+
+  const expressionValues: Record<string, unknown> = {
+    ":status": Status.RUNNING,
+    ":now": now,
+  };
+  if (filter.userId) {
+    expressionValues[":userId"] = filter.userId;
+  } else {
+    expressionValues[":guildId"] = filter.guildId;
+  }
+
   const response = await docClient.send(
     new QueryCommand({
       TableName: SESSIONS_TABLE,
-      IndexName: "PendingIndex",
-      KeyConditionExpression: "#status = :status AND expiresAt > :now",
+      IndexName: indexName,
+      KeyConditionExpression: keyCondition,
       ExpressionAttributeNames: {
         "#status": "status",
       },
-      ExpressionAttributeValues: {
-        ":status": Status.RUNNING,
-        ":now": now,
-      },
+      ExpressionAttributeValues: expressionValues,
     }),
   );
 
@@ -275,18 +288,67 @@ export async function updateStatus(sessionId: string, status: SessionStatus): Pr
 }
 
 /**
+ * セッションステータスを条件付きで更新
+ *
+ * P1-5修正: 現在のステータスが指定値の場合のみ更新（二重実行防止）
+ *
+ * @param sessionId - セッションID
+ * @param newStatus - 新しいステータス
+ * @param expectedCurrentStatus - 期待する現在のステータス
+ * @returns 更新が成功したかどうか
+ */
+export async function updateStatusIf(
+  sessionId: string,
+  newStatus: SessionStatus,
+  expectedCurrentStatus: SessionStatus,
+): Promise<boolean> {
+  try {
+    await docClient.send(
+      new UpdateCommand({
+        TableName: SESSIONS_TABLE,
+        Key: { sessionId },
+        UpdateExpression: "SET #status = :newStatus, #updated = :updated",
+        ConditionExpression: "#status = :expectedStatus",
+        ExpressionAttributeNames: {
+          "#status": "status",
+          "#updated": "lastUpdateTime",
+        },
+        ExpressionAttributeValues: {
+          ":newStatus": newStatus,
+          ":expectedStatus": expectedCurrentStatus,
+          ":updated": Date.now(),
+        },
+      }),
+    );
+    return true; // 更新成功
+  } catch (error: unknown) {
+    // ConditionalCheckFailedExceptionは正常（他のプロセスが既に更新）
+    const err = error as { name: string; code: string };
+    if (err.code === "ConditionalCheckFailedException") {
+      return false; // 条件不一致で更新スキップ
+    }
+    throw error; // その他のエラーは再スロー
+  }
+}
+
+/**
  * 期限切れセッションをクリーンアップ
  *
  * 手動クリーンアップ用。通常はTTLにより自動削除される。
+ *
+ * P1-4修正: PendingIndex削除に伴い、Scanを使用（高コストなので注意）
+ *
+ * NOTE: userId/guildIdフィルタは削除（型定義の複雑化を回避）
+ * 必要に応じてgetPendingSessionsでユーザー/ギルド単位で実行してください
  */
 export async function cleanupExpiredSessions(): Promise<number> {
   const now = Math.floor(Date.now() / 1000);
 
+  // Scan操作（高コストなので注意して使用）
   const response = await docClient.send(
-    new QueryCommand({
+    new ScanCommand({
       TableName: SESSIONS_TABLE,
-      IndexName: "PendingIndex",
-      KeyConditionExpression: "#status = :status AND expiresAt < :now",
+      FilterExpression: "#status = :status AND expiresAt < :now",
       ExpressionAttributeNames: {
         "#status": "status",
       },
@@ -299,7 +361,10 @@ export async function cleanupExpiredSessions(): Promise<number> {
 
   const expired = response.Items || [];
   for (const item of expired) {
-    await deleteSession(item.sessionId as string);
+    const sessionId = (item as unknown as { sessionId: string }).sessionId;
+    if (sessionId) {
+      await deleteSession(sessionId);
+    }
   }
 
   return expired.length;

@@ -5,7 +5,7 @@
  */
 
 import type { PersistedSessionState, PendingSessionsFilter } from "./types.js";
-import { getPendingSessions, updateStatus, deleteSession } from "./manager.js";
+import { getPendingSessions, updateStatus, updateStatusIf, deleteSession } from "./manager.js";
 import { SessionStatus } from "./types.js";
 
 /**
@@ -87,8 +87,21 @@ export async function recoverPendingSessions(
     }
 
     try {
-      // ステータスを一時停止に変更（二重実行防止）
-      await updateStatus(session.metadata.sessionId, SessionStatus.PAUSED);
+      // P1-5修正: 条件付き更新（現在のステータスがRUNNINGの場合のみ）
+      // 他のリカバリプロセスが既に処理していた場合はスキップ
+      const updated = await updateStatusIf(
+        session.metadata.sessionId,
+        SessionStatus.PAUSED,
+        SessionStatus.RUNNING,
+      );
+
+      if (!updated) {
+        console.log(
+          `[Recovery] Session ${session.metadata.sessionId} already being recovered by another process`,
+        );
+        result.skipped++;
+        continue;
+      }
 
       // コールバック実行
       if (onRestore) {

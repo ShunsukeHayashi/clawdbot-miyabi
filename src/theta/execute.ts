@@ -38,11 +38,14 @@ const DEFAULT_OPTIONS: ExecuteOptions = {
 export async function execute<T = unknown>(
   state: ThetaCycleState,
   decision: DecisionResult,
-  executor: (params: Record<string, unknown>) => Promise<T>,
+  executor: (params: Record<string, unknown>, signal?: AbortSignal) => Promise<T>,
   options?: Partial<ExecuteOptions>,
 ): Promise<{ state: ThetaCycleState; result: ExecutionResult }> {
   const { runId } = state;
   const opts = { ...DEFAULT_OPTIONS, ...options };
+
+  // P1-1修正: 実行開始時にcurrentPhaseを設定
+  state.currentPhase = ThetaPhase.EXECUTE;
 
   // フェーズ開始イベント
   emitPhaseEvent(runId, ThetaEventType.PHASE_START, {
@@ -82,7 +85,6 @@ export async function execute<T = unknown>(
     };
 
     state.events.push(executionEvent);
-    state.currentPhase = ThetaPhase.EXECUTE;
     state.context.set("execute.result", result);
 
     // Agentイベントを発行
@@ -140,9 +142,11 @@ export async function execute<T = unknown>(
 
 /**
  * リトライ付きで実行する
+ *
+ * P1-2修正: AbortControllerを使用してタイムアウト時に実行を確実にキャンセル
  */
 async function executeWithRetry<T>(
-  executor: (params: Record<string, unknown>) => Promise<T>,
+  executor: (params: Record<string, unknown>, signal?: AbortSignal) => Promise<T>,
   params: Record<string, unknown>,
   timeout: number,
   retries: number,
@@ -151,14 +155,20 @@ async function executeWithRetry<T>(
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    // 各試行ごとに新しいAbortControllerを作成
+    const controller = new AbortController();
+    const signal = controller.signal;
+
     try {
       // 進度通知
       onProgress?.(attempt / (retries + 1));
 
-      // タイムアウト付き実行
-      const result = await withTimeout(executor(params), timeout);
+      // タイムアウト付き実行（AbortSignalを渡す）
+      const result = await withTimeout(executor(params, signal), timeout, controller);
       return result;
     } catch (error) {
+      // タイムアウトの場合はAbortControllerでキャンセル済み
+      // それ以外のエラーも記録
       lastError = error instanceof Error ? error : new Error(String(error));
 
       // 最後の試行で失敗した場合はエラーを投げる
@@ -177,13 +187,25 @@ async function executeWithRetry<T>(
 
 /**
  * タイムアウト付きで実行する
+ *
+ * P1-2修正: AbortControllerで確実にキャンセル
  */
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  controller: AbortController,
+): Promise<T> {
   return Promise.race([
     promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs),
-    ),
+    new Promise<T>((_, reject) => {
+      const timeoutId = setTimeout(() => {
+        controller.abort(); // 実行をキャンセル
+        reject(new Error(`Timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      // Promiseが解決したらクリアンアップ（キャンセルされても実行）
+      promise.finally?.(() => clearTimeout(timeoutId));
+    }),
   ]);
 }
 
@@ -231,7 +253,7 @@ function emitPhaseEvent(runId: string, type: ThetaEventType, data: Record<string
 export function executeBackground<T = unknown>(
   state: ThetaCycleState,
   decision: DecisionResult,
-  executor: (params: Record<string, unknown>) => Promise<T>,
+  executor: (params: Record<string, unknown>, signal?: AbortSignal) => Promise<T>,
   options?: Partial<ExecuteOptions>,
 ): string {
   const executionId = `bg_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;

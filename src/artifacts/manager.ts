@@ -59,12 +59,14 @@ export async function initializeTable(): Promise<void> {
     await ddbClient.send(
       new CreateTableCommand({
         TableName: ARTIFACTS_TABLE,
+        // P1-3修正: GSIで使用する全属性をAttributeDefinitionsに追加
         AttributeDefinitions: [
           { AttributeName: "id", AttributeType: "S" },
           { AttributeName: "sessionId", AttributeType: "S" },
           { AttributeName: "userId", AttributeType: "S" },
           { AttributeName: "type", AttributeType: "S" },
-          { AttributeName: "expiresAt", AttributeType: "N" },
+          { AttributeName: "createdAt", AttributeType: "N" }, // GSI用
+          { AttributeName: "expiresAt", AttributeType: "N" }, // GSI用
         ],
         KeySchema: [{ AttributeName: "id", KeyType: "HASH" }],
         GlobalSecondaryIndexes: [
