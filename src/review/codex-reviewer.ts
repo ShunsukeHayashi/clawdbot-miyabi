@@ -6,6 +6,9 @@
 
 import { exec } from "child_process";
 import { promisify } from "util";
+import { writeFileSync, unlinkSync } from "fs";
+import { mkdtempSync } from "fs";
+import { join } from "path";
 import type {
   CodexReview,
   ReviewRequest,
@@ -29,6 +32,9 @@ const DEFAULT_TIMEOUT = 5 * 60 * 1000;
 /** デフォルトtmuxターゲット (MacBook用) */
 const DEFAULT_TMUX_TARGET = "%2"; // カエデ (CodeGen) のペイン
 
+/** P1-7修正: 一時ファイルの最大サイズ (4000文字) */
+const MAX_COMMAND_LENGTH = 4000;
+
 /**
  * シェルコマンド用に文字列をエスケープ
  * tmux send-keys に安全に渡すためのエスケープ処理
@@ -50,6 +56,8 @@ function escapeShellString(str: string): string {
 /**
  * tmuxコマンドを実行
  *
+ * P1-8修正: capture-paneで出力を取得する
+ *
  * @param command - 実行するコマンド
  * @param target - tmuxターゲット (ペインID)
  * @param options - オプション
@@ -62,21 +70,32 @@ async function execTmux(
 ): Promise<TmuxResult> {
   const { timeout = DEFAULT_TIMEOUT, env = {} } = options;
 
-  // tmux send-keys でコマンドを送信 (コマンドインジェクション対策)
-  const escapedCommand = escapeShellString(command);
-  const sendCommand = `tmux send-keys -t ${target} "${escapedCommand}" Enter`;
-
   try {
-    // タイムアウト付きで実行
-    const { stdout, stderr } = await execAsync(sendCommand, {
+    // tmux send-keys でコマンドを送信 (コマンドインジェクション対策)
+    const escapedCommand = escapeShellString(command);
+    const sendCommand = `tmux send-keys -t ${target} "${escapedCommand}" Enter`;
+
+    // コマンド送信
+    await execAsync(sendCommand, {
       timeout,
       env: { ...process.env, ...env },
     });
 
+    // P1-8修正: 実行完了を待ってから出力をキャプチャ
+    // コマンド実行に十分な時間を待つ（デフォルトでtimeoutの80%を待機）
+    const waitTime = Math.min(timeout * 0.8, 30000); // 最大30秒待機
+    await sleep(waitTime);
+
+    // capture-paneでペインの内容を取得
+    const captureCommand = `tmux capture-pane -t ${target} -p -S -`;
+    const { stdout: captured } = await execAsync(captureCommand, {
+      timeout: 5000,
+    });
+
     return {
       success: true,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
+      stdout: captured.trim(),
+      stderr: "",
       exitCode: 0,
     };
   } catch (error: unknown) {
@@ -91,7 +110,16 @@ async function execTmux(
 }
 
 /**
+ * 指定ミリ秒待機する
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
  * Codexでコードレビューを実行
+ *
+ * P1-7修正: 一時ファイルのクリーンアップ処理を追加
  *
  * @param content - レビュー対象コード
  * @param options - オプション
@@ -103,11 +131,10 @@ export async function runCodexReview(
 ): Promise<ReviewResult> {
   const startTime = Date.now();
 
-  try {
-    // Codexに送信するコマンド構築
-    // 既存のスキルやコマンドを使用
-    const command = buildCodexCommand(content, options);
+  // P1-7修正: buildCodexCommandはcleanup関数を返す場合がある
+  const { command, cleanup } = buildCodexCommand(content, options);
 
+  try {
     // tmux経由でCodexを実行
     const result = await execTmux(command, options.tmuxTarget, {
       timeout: options.timeout ?? DEFAULT_TIMEOUT,
@@ -138,30 +165,77 @@ export async function runCodexReview(
       error: error instanceof Error ? error.message : String(error),
       duration,
     };
+  } finally {
+    // P1-7修正: 一時ファイルをクリーンアップ
+    cleanup?.();
   }
 }
 
 /**
  * Codexコマンドを構築
  *
+ * P1-7修正: 長い入力は一時ファイル経由で処理
+ *
  * @param content - レビュー対象コード
  * @param options - オプション
- * @returns コマンド文字列
+ * @returns コマンド文字列とクリーンアップ関数
  */
-function buildCodexCommand(content: string, options: ReviewOptions): string {
-  // コンテンツを一時ファイルに保存または引数として渡す
-  // 長いコードの場合はファイル経由が安全
+function buildCodexCommand(
+  content: string,
+  options: ReviewOptions,
+): { command: string; cleanup?: () => void } {
+  // P1-7修正: 長いコードは一時ファイルに書き出し
+  if (content.length > MAX_COMMAND_LENGTH) {
+    // 一時ディレクトリを作成
+    const tempDir = mkdtempSync("/tmp/codex-review-");
+    const tempFile = join(tempDir, "code.txt");
 
-  const maxLength = 1000;
-  const useFile = content.length > maxLength;
+    try {
+      // コンテンツをファイルに書き出し
+      writeFileSync(tempFile, content, "utf-8");
 
-  if (useFile) {
-    // TODO: 一時ファイルを使用する場合
-    // 今回は簡易的に引数渡し (コマンドインジェクション対策)
-    const escapedContent = escapeShellString(content);
-    return `codex review "${escapedContent}"`;
+      // オプションを付与
+      const opts: string[] = [];
+      if (options.threshold) {
+        opts.push(`--threshold ${options.threshold}`);
+      }
+      if (options.issuesOnly) {
+        opts.push("--issues-only");
+      }
+      if (options.suggestionsOnly) {
+        opts.push("--suggestions-only");
+      }
+      if (options.verbose) {
+        opts.push("--verbose");
+      }
+
+      const cmd = `codex review ${opts.join(" ")} -f ${escapeShellString(tempFile)}`;
+
+      // クリーンアップ関数を返す
+      return {
+        command: cmd,
+        cleanup: () => {
+          try {
+            unlinkSync(tempFile);
+          } catch {
+            // クリーンアップエラーは無視
+          }
+          try {
+            // 一時ディレクトリの削除（rmdirは空の場合のみ成功）
+            const { rmdirSync } = require("fs");
+            rmdirSync(tempDir);
+          } catch {
+            // ディレクトリが空でない場合は無視
+          }
+        },
+      };
+    } catch (error) {
+      // ファイル書き込みエラー時はフォールバック
+      console.warn("[CodexReviewer] Failed to write temp file, using inline content");
+    }
   }
 
+  // 短いコンテンツは引数渡し
   // オプションを付与
   const opts: string[] = [];
   if (options.threshold) {
@@ -180,7 +254,7 @@ function buildCodexCommand(content: string, options: ReviewOptions): string {
   // コマンドインジェクション対策: contentをエスケープしてクォート
   const escapedContent = escapeShellString(content);
   const cmd = `codex review ${opts.join(" ")} "${escapedContent}"`;
-  return cmd;
+  return { command: cmd };
 }
 
 /**

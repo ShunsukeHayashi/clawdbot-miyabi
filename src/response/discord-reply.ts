@@ -129,7 +129,10 @@ function buildEmbeds(embeds: ReplyEmbed[]): Record<string, unknown>[] {
  * @param options - オプション
  */
 export async function sendReply(replyData: ReplyData, options: DiscordReplyOptions): Promise<void> {
-  const { api, channelId, messageId } = options;
+  const { api, channelId, messageId, threadId } = options;
+
+  // P1-6修正: スレッド内返信の場合はthreadIdをチャンネルとして使用
+  const targetChannelId = threadId || channelId;
 
   // 引用メタデータ構築
   const quote: QuoteMetadata = {
@@ -157,10 +160,19 @@ export async function sendReply(replyData: ReplyData, options: DiscordReplyOptio
   // メンション設定
   const allowedMentions = buildAllowedMentions(options);
 
+  // P1-6修正: message_referenceにthread_idを追加
+  const messageReference: Record<string, string> = {
+    channel_id: channelId,
+    message_id: messageId,
+  };
+  if (threadId) {
+    messageReference.thread_id = threadId;
+  }
+
   // ファイル添付がある場合
   if (options.fileUrls && options.fileUrls.length > 0) {
     // 最初のメッセージでテキスト+最初のファイル
-    await api.rest.post(`/channels/${channelId}/messages`, {
+    await api.rest.post(`/channels/${targetChannelId}/messages`, {
       content,
       allowed_mentions: allowedMentions,
       attachments: options.fileUrls.slice(0, 1).map((url, i) => ({
@@ -168,15 +180,12 @@ export async function sendReply(replyData: ReplyData, options: DiscordReplyOptio
         description: `artifact-${i}`,
         url,
       })),
-      message_reference: {
-        channel_id: channelId,
-        message_id: messageId,
-      },
+      message_reference: messageReference,
     });
 
     // 追加ファイルを別メッセージで送信
     for (const fileUrl of options.fileUrls.slice(1)) {
-      await api.rest.post(`/channels/${channelId}/messages`, {
+      await api.rest.post(`/channels/${targetChannelId}/messages`, {
         content: "",
         attachments: [
           {
@@ -192,25 +201,21 @@ export async function sendReply(replyData: ReplyData, options: DiscordReplyOptio
 
   // Embedがある場合
   if (options.embeds && options.embeds.length > 0) {
-    await api.rest.post(`/channels/${channelId}/messages`, {
+    await api.rest.post(`/channels/${targetChannelId}/messages`, {
       content,
       allowed_mentions: allowedMentions,
       embeds: buildEmbeds(options.embeds),
-      message_reference: {
-        channel_id: channelId,
-        message_id: messageId,
-      },
+      message_reference: messageReference,
     });
     return;
   }
 
   // シンプルテキスト返信
-  await api.rest.post(`/channels/${channelId}/messages`, {
+  await api.rest.post(`/channels/${targetChannelId}/messages`, {
     content,
     allowed_mentions: allowedMentions,
     message_reference: {
-      channel_id: channelId,
-      message_id: messageId,
+      ...messageReference,
       fail_if_not_exists: false,
     },
   });
