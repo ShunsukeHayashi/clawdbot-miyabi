@@ -98,8 +98,3 @@ resource "aws_cloudwatch_metric_alarm" "ecs_memory_alarm" {
   }
 }
 
-# CloudWatch Log Group Retention (30 days)
-resource "aws_cloudwatch_log_group" "clawdbot_retention" {
-  name              = aws_cloudwatch_log_group.clawdbot.name
-  retention_in_days = 30
-}
