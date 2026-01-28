@@ -39,10 +39,11 @@ apps/ios/build
 **/*.trace
 
 # large app trees not needed for CLI build
-apps/
 assets/
-Peekaboo/
+Peekabook/
 Swabble/
 Core/
 Users/
-vendor/
+
+# vendor/ is needed for A2UI
+# apps/shared/ClawdbotKit is needed for A2UI

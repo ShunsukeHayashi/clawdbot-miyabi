@@ -67,7 +67,7 @@ variable "ecs_service_desired_count" {
 variable "discord_token_secret_name" {
   description = "AWS Secrets Manager secret name for Discord bot token"
   type        = string
-  default     = "clawdbot/discord-token"
+  default     = "ppal-clawdbot/discord-token"
 }
 
 # DEPRECATED: Use discord_token_secret_name with AWS Secrets Manager instead

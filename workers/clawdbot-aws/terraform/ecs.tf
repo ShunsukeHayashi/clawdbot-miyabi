@@ -60,9 +60,13 @@ resource "aws_ecs_task_definition" "clawdbot" {
       cpu       = var.ecs_task_cpu
       memory    = var.ecs_task_memory
       essential = true
-      command   = ["node", "dist/entry.js", "gateway", "--allow-unconfigured"]
+      command = ["sh", "-c", "mkdir -p /home/node/.clawdbot && printenv CLAWDBOT_CONFIG > /home/node/.clawdbot/clawdbot.json && node dist/entry.js gateway"]
 
       environment = [
+        {
+          name  = "NODE_OPTIONS"
+          value = "--max-old-space-size=1536"
+        },
         {
           name  = "AWS_REGION"
           value = var.aws_region
@@ -80,12 +84,19 @@ resource "aws_ecs_task_definition" "clawdbot" {
           value = aws_s3_bucket.artifacts.id
         },
         {
-          name  = "DISCORD_BOT_TOKEN"
-          value = data.aws_secretsmanager_secret_version.discord_token.secret_string
+          name  = "CLAWDBOT_SESSIONS_BASE"
+          value = "/home/node/.clawdbot/sessions"
         },
         {
-          name  = "CLAWDBOT_FORCE_BUILD"
-          value = "0"
+          name  = "CLAWDBOT_CREDENTIALS_BASE"
+          value = "/home/node/.clawdbot/credentials"
+        }
+      ]
+
+      secrets = [
+        {
+          name      = "CLAWDBOT_CONFIG"
+          valueFrom = data.aws_secretsmanager_secret.clawdbot_config.arn
         }
       ]
 
